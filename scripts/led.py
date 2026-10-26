@@ -54,6 +54,13 @@ PROTOCOLS = {
         "off": "000000ab",
         "color": "{r:02x}{g:02x}{b:02x}1e",
     },
+    # BJ_LED (BojiaLED app, e.g. NBBUFF BJ-5VRGB/TY-C). ee02 accepts the same frames.
+    "BJ_LED": {
+        "char": "0000ee01-0000-1000-8000-00805f9b34fb",
+        "on": "6996020101",
+        "off": "6996020100",
+        "color": "69960502{r:02x}{g:02x}{b:02x}",
+    },
 }
 
 DEFAULT_PRESETS = {
