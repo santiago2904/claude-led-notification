@@ -1,0 +1,13 @@
+{
+  "name": "led-notify",
+  "version": "0.1.0",
+  "description": "Make a Bluetooth LED strip react to Claude Code: dim blue while thinking, red when done, orange when it needs you.",
+  "author": {
+    "name": "santiago2904",
+    "url": "https://github.com/santiago2904"
+  },
+  "homepage": "https://github.com/santiago2904/claude-led-notification",
+  "repository": "https://github.com/santiago2904/claude-led-notification",
+  "license": "MIT",
+  "keywords": ["led", "bluetooth", "ble", "notifications", "hooks", "hardware"]
+}

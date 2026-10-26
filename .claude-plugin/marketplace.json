@@ -1,0 +1,15 @@
+{
+  "name": "led-notify",
+  "description": "LED strip notifications for Claude Code.",
+  "owner": {
+    "name": "santiago2904",
+    "url": "https://github.com/santiago2904"
+  },
+  "plugins": [
+    {
+      "name": "led-notify",
+      "source": "./",
+      "description": "Make a Bluetooth LED strip react to Claude Code."
+    }
+  ]
+}

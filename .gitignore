@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# Local state belongs in ~/.config/claude-led/, never in the repo
+config.json
+led.sock
+*.log
