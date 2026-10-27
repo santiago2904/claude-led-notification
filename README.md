@@ -41,7 +41,7 @@ In Claude Code:
 
 1. Close the controller's phone app (it holds the only BLE connection).
 2. Run `/led-setup`: checks Python and bleak, scans, lets you pick the device, probes the protocol and runs a test.
-3. Run `/led-start` to start the daemon. On macOS you can use `/led-autostart` instead to start it at login.
+3. On macOS run `/led-autostart`: the daemon starts now and at every login, no terminal needed. Elsewhere (or for a one-off) run `/led-start`.
 
 | Command | What it does |
 | --- | --- |
@@ -49,7 +49,7 @@ In Claude Code:
 | `/led-start` | Start the daemon in the background |
 | `/led-stop` | Stop the daemon |
 | `/led-color <preset> <R G B \| off>` | Change a preset color |
-| `/led-autostart [remove]` | (macOS) Start at login via a LaunchAgent |
+| `/led-autostart [remove]` | (macOS) Run the daemon now and at every login (LaunchAgent) |
 
 Plugin commands may also appear namespaced, e.g. `/led-notify:led-setup`.
 
@@ -85,17 +85,22 @@ You can also drive it by hand: `python3 scripts/led.py send "color 255 0 128"`.
 
 ## Troubleshooting
 
-**macOS Bluetooth permission / `led.py` exits with code 134.** macOS attributes Bluetooth access to the terminal app that launched Python, and kills the process (SIGABRT, exit 134, no prompt) if that app doesn't declare Bluetooth usage. **Warp and Terminal.app don't; iTerm2 does.** Run `/led-setup`, `/led-start` and the daemon from Claude Code inside iTerm2 (or another terminal that shows a Bluetooth prompt) and accept the prompt, or enable it in *System Settings → Privacy & Security → Bluetooth*. Once the daemon runs, the hooks work from any terminal, since they only talk to the Unix socket. `/led-autostart` is untested: under launchd the Python binary itself needs the permission, and Homebrew's Python doesn't declare it either.
+**macOS Bluetooth permission.** macOS kills (exit 134, no prompt) any process that uses Bluetooth when the app responsible for it doesn't declare Bluetooth usage. That includes Warp, Terminal.app and launchd. So on macOS, `scan`, `probe`, `test` and `serve` transparently re-run themselves inside a tiny `LED Notify.app` that `led.py` builds in `~/.config/claude-led/` from your Python (python.org or Homebrew framework builds). That makes them work from any terminal and at login. Allow the *"LED Notify" would like to use Bluetooth* prompt, or enable it in *System Settings → Privacy & Security → Bluetooth*. After a Python upgrade the app is rebuilt and macOS may ask again.
 
 **The phone app blocks the connection.** Most controllers accept a single BLE connection. If the phone app (BojiaLED, duoCo Strip, Happy Lighting…) is open or connected in the background, `scan` may not see the device and `probe`/`serve` can't connect. Force-close the app or turn off the phone's Bluetooth.
 
 **The daemon is down / nothing lights up.**
+- With `/led-autostart`, launchd restarts it if it dies: `launchctl print gui/$(id -u)/com.claude-led.daemon`.
 - `python3 scripts/led.py status` prints `running` or `stopped`.
 - Check `~/.config/claude-led/led.log`. Repeated `BLE connect failed` means the controller is out of range, powered off, or held by another device. The daemon keeps retrying every 5 s.
 - `probe` and `test` need the BLE connection too: stop the daemon (`/led-stop`) before running them.
 - A stale `led.sock` is removed automatically when the daemon starts.
 
 **`bleak` not found.** The hooks and the daemon use `python3` from your `PATH`. Install bleak for that interpreter: `python3 -m pip install --user bleak`.
+
+## Other coding agents
+
+The daemon is harness-agnostic. GitHub Copilot CLI (tested), Codex CLI, Gemini CLI, Cursor and OpenCode can drive it too. See [docs/other-harnesses.md](docs/other-harnesses.md).
 
 ## Tested controllers
 
@@ -136,11 +141,12 @@ El protocolo del controlador **no está fijado para ningún modelo**: `/led-setu
 /plugin install led-notify@led-notify
 ```
 
-**Configuración:** cierra la app del celular, ejecuta `/led-setup` y luego `/led-start` (o `/led-autostart` en macOS para arrancar al iniciar sesión).
+**Configuración:** cierra la app del celular, ejecuta `/led-setup` y luego `/led-autostart` en macOS (arranca ahora y en cada inicio de sesión, sin terminal abierta) o `/led-start`.
 
 **Colores:** `/led-color done 0 255 0`, `/led-color thinking off`, o edita `~/.config/claude-led/config.json`.
 
 **Problemas comunes:**
-- *Permiso de Bluetooth (macOS) / código de salida 134:* macOS mata el proceso si la terminal no declara uso de Bluetooth. **Warp y Terminal.app no lo declaran; iTerm2 sí.** Haz el setup y arranca el daemon desde iTerm2. Después los hooks funcionan desde cualquier terminal.
+- *Permiso de Bluetooth (macOS):* los comandos Bluetooth corren dentro de una pequeña `LED Notify.app` que `led.py` crea sola, así que funcionan desde cualquier terminal (Warp incluido). Permite el aviso *"LED Notify" quiere usar Bluetooth*.
+- *Otros agentes (Copilot CLI, Codex, Gemini, Cursor, OpenCode):* ver [docs/other-harnesses.md](docs/other-harnesses.md).
 - *La app del celular bloquea la conexión:* ciérrala por completo o apaga el Bluetooth del teléfono.
 - *Daemon caído:* `python3 scripts/led.py status` y revisa `~/.config/claude-led/led.log`.

@@ -1,6 +1,6 @@
 {
   "name": "led-notify",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Make a Bluetooth LED strip react to Claude Code: dim blue while thinking, red when done, orange when it needs you.",
   "author": {
     "name": "santiago2904",

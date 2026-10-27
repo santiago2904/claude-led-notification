@@ -9,6 +9,7 @@ Usage:
   led.py status                    is the daemon running?
   led.py preset NAME VALUE...      change a preset in config.json
   led.py test                      red for 2 s, then off
+  led.py autostart [remove]        macOS: run the daemon at login (LaunchAgent)
 
 Commands: "color R G B", "flash R G B SECONDS", "off".
 Presets:  thinking, done, attention, off (editable in config.json).
@@ -19,13 +20,52 @@ so updating the plugin never wipes them.
 import asyncio
 import json
 import os
+import shutil
 import signal
 import socket
+import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser(os.environ.get("CLAUDE_LED_HOME", "~/.config/claude-led"))
 CONFIG = os.path.join(HOME, "config.json")
 SOCK = os.path.join(HOME, "led.sock")
+LOG = os.path.join(HOME, "led.log")
+
+# macOS only: see build_app().
+APP = os.path.join(HOME, "LED Notify.app")
+APP_EXE = os.path.join(APP, "Contents", "MacOS", "led-notify")
+LABEL = "com.claude-led.daemon"
+AGENT = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.github.santiago2904.led-notify</string>
+  <key>CFBundleName</key><string>LED Notify</string>
+  <key>CFBundleExecutable</key><string>led-notify</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>LED Notify controls your LED strip over Bluetooth.</string>
+</dict>
+</plist>
+"""
+AGENT_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%(label)s</string>
+  <key>ProgramArguments</key>
+  <array><string>%(exe)s</string><string>%(script)s</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>%(log)s</string>
+  <key>StandardErrorPath</key><string>%(log)s</string>
+</dict>
+</plist>
+"""
 
 # Each protocol: the GATT characteristic to write to and hex frame templates.
 # To add one, see CONTRIBUTING.md.
@@ -135,6 +175,93 @@ def send(cmd):
         s.settimeout(0.5)
         s.connect(SOCK)
         s.sendall(cmd.encode() + b"\n")
+
+
+def build_app():
+    """macOS kills (exit 134, no prompt) any process that touches Bluetooth when the app
+    responsible for it doesn't declare Bluetooth usage: Warp, Terminal.app, launchd.
+    So run Python from a tiny "LED Notify.app" that does declare it. Launched through
+    `open` or launchd, the app is its own responsible process and gets its own permission."""
+    src = os.path.realpath(os.path.join(sys.base_prefix, "Resources/Python.app/Contents/MacOS/Python"))
+    if not os.path.exists(src):
+        return False  # not a framework build (python.org and Homebrew are)
+    stamp = os.path.join(HOME, "app-source")
+    try:
+        with open(stamp) as f:
+            if f.read() == src and os.path.exists(APP_EXE):
+                return True
+    except OSError:
+        pass
+    # Rebuilt only when Python changes, since macOS may ask for the permission again.
+    shutil.rmtree(APP, ignore_errors=True)
+    os.makedirs(os.path.dirname(APP_EXE))
+    shutil.copy(src, APP_EXE)
+    with open(os.path.join(APP, "Contents", "Info.plist"), "w") as f:
+        f.write(INFO_PLIST)
+    subprocess.run(["codesign", "--force", "--sign", "-", APP], check=True, capture_output=True)
+    with open(stamp, "w") as f:
+        f.write(src)
+    return True
+
+
+def in_app():
+    return os.path.realpath(sys.executable) == os.path.realpath(APP_EXE)
+
+
+def via_app(args):
+    """Re-run `led.py ARGS` inside LED Notify.app and relay its output and exit code."""
+    script = os.path.abspath(__file__)
+    if args[0] == "serve":
+        subprocess.run(["open", "-n", "-a", APP, "--stdout", LOG, "--stderr", LOG, "--args", script, "serve"])
+        return 0
+    out, rc = os.path.join(HOME, "app.out"), os.path.join(HOME, "app.rc")
+    for path in (out, rc):
+        if os.path.exists(path):
+            os.remove(path)
+    subprocess.run(["open", "-n", "-W", "-a", APP, "--stdout", out, "--stderr", out, "--args", script] + args,
+                   capture_output=True)
+    # `open -W` can return early when the app exits fast; the app writes app.rc last.
+    for _ in range(600):
+        if os.path.exists(rc):
+            break
+        time.sleep(0.1)
+    if os.path.exists(out):
+        with open(out) as f:
+            sys.stdout.write(f.read())
+    if not os.path.exists(rc):
+        log("LED Notify.app did not finish. Check System Settings > Privacy & Security > Bluetooth.")
+        return 1
+    with open(rc) as f:
+        return int(f.read())
+
+
+def autostart(remove=False):
+    if sys.platform != "darwin":
+        log("macOS only. On Linux, run `python3 %s serve` from a systemd user service." % os.path.abspath(__file__))
+        return 1
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], capture_output=True)
+    if remove:
+        for path in (AGENT, os.path.join(HOME, "led.py")):
+            if os.path.exists(path):
+                os.remove(path)
+        log("Autostart removed.")
+        return 0
+    if not load_config().get("address"):
+        log("No device configured. Run /led-setup first.")
+        return 1
+    if not build_app():
+        log("Needs a framework build of Python (python.org or Homebrew).")
+        return 1
+    # Stable copy: the plugin directory changes on every update.
+    script = os.path.join(HOME, "led.py")
+    shutil.copy(os.path.abspath(__file__), script)
+    subprocess.run(["pkill", "-f", "led.py serve"], capture_output=True)
+    os.makedirs(os.path.dirname(AGENT), exist_ok=True)
+    with open(AGENT, "w") as f:
+        f.write(AGENT_PLIST % {"label": LABEL, "exe": APP_EXE, "script": script, "log": LOG})
+    subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), AGENT], check=True)
+    log("Autostart installed: the daemon runs now and at every login.")
+    return 0
 
 
 async def scan():
@@ -344,6 +471,10 @@ def main(argv):
         except ValueError as e:
             log("Invalid value:", e)
             return 1
+    if cmd == "autostart":
+        return autostart(args == ["remove"])
+    if cmd in ("scan", "probe", "serve", "test") and sys.platform == "darwin" and not in_app() and build_app():
+        return via_app(argv[1:])
     if cmd == "scan":
         return asyncio.run(scan())
     if cmd == "probe" and args:
@@ -360,8 +491,14 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    code = 1
     try:
-        sys.exit(main(sys.argv))
+        code = main(sys.argv) or 0
     except ImportError:
         print("bleak is not installed: python3 -m pip install bleak", file=sys.stderr)
-        sys.exit(1)
+    finally:
+        if in_app() and sys.argv[1:2] != ["serve"]:
+            sys.stdout.flush()
+            with open(os.path.join(HOME, "app.rc"), "w") as f:
+                f.write(str(code))  # tells via_app() we're done
+    sys.exit(code)
