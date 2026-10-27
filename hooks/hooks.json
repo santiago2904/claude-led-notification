@@ -1,13 +1,12 @@
 {
-  "description": "Send a preset to the led-notify daemon. Silent and a no-op when the daemon is not running.",
+  "description": "Send a preset to the led-notify daemon. Silent and a no-op when the daemon is not running. Falls back from python3 to python for Windows.",
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/led.py", "send", "thinking"],
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send thinking 2>/dev/null || python \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send thinking 2>/dev/null || true",
             "timeout": 3
           }
         ]
@@ -18,8 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/led.py", "send", "done"],
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send done 2>/dev/null || python \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send done 2>/dev/null || true",
             "timeout": 3
           }
         ]
@@ -30,8 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/led.py", "send", "attention"],
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send attention 2>/dev/null || python \"${CLAUDE_PLUGIN_ROOT}/scripts/led.py\" send attention 2>/dev/null || true",
             "timeout": 3
           }
         ]

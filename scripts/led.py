@@ -4,18 +4,20 @@
 Usage:
   led.py scan                      list nearby BLE devices
   led.py probe ADDR [PROTOCOL]     try known protocols and save the one that works
-  led.py serve                     daemon: keep the BLE connection open, listen on a Unix socket
+  led.py serve                     daemon: keep the BLE connection open, listen on 127.0.0.1
+  led.py start | stop              run the daemon in the background / stop it
   led.py send PRESET|COMMAND       used by hooks: silent, 0.5 s timeout, never fails
   led.py status                    is the daemon running?
   led.py preset NAME VALUE...      change a preset in config.json
   led.py test                      red for 2 s, then off
-  led.py autostart [remove]        macOS: run the daemon at login (LaunchAgent)
+  led.py autostart [remove]        run the daemon at login (macOS, Linux, Windows)
 
 Commands: "color R G B", "flash R G B SECONDS", "off".
 Presets:  thinking, done, attention, off (editable in config.json).
 
-Config, socket and log live in ~/.config/claude-led/ (override with CLAUDE_LED_HOME),
-so updating the plugin never wipes them.
+Config and log live in ~/.config/claude-led/ (override with CLAUDE_LED_HOME), so
+updating the plugin never wipes them. The daemon listens on 127.0.0.1:47821
+(override with CLAUDE_LED_PORT); TCP rather than a Unix socket so Windows works too.
 """
 import asyncio
 import json
@@ -29,8 +31,26 @@ import time
 
 HOME = os.path.expanduser(os.environ.get("CLAUDE_LED_HOME", "~/.config/claude-led"))
 CONFIG = os.path.join(HOME, "config.json")
-SOCK = os.path.join(HOME, "led.sock")
 LOG = os.path.join(HOME, "led.log")
+ADDR = ("127.0.0.1", int(os.environ.get("CLAUDE_LED_PORT", "47821")))
+WINDOWS = sys.platform == "win32"
+# Linux: systemd user service. Windows: a script in the Startup folder.
+UNIT = os.path.expanduser("~/.config/systemd/user/led-notify.service")
+STARTUP = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup\led-notify.cmd")
+UNIT_TEXT = """[Unit]
+Description=led-notify: LED strip notifications for coding agents
+After=bluetooth.target
+
+[Service]
+ExecStart="%(exe)s" "%(script)s" serve
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%(log)s
+StandardError=append:%(log)s
+
+[Install]
+WantedBy=default.target
+"""
 
 # macOS only: see build_app().
 APP = os.path.join(HOME, "LED Notify.app")
@@ -59,7 +79,7 @@ AGENT_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
   <key>ProgramArguments</key>
   <array><string>%(exe)s</string><string>%(script)s</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>%(log)s</string>
   <key>StandardErrorPath</key><string>%(log)s</string>
@@ -161,9 +181,7 @@ def rgb(values):
 
 def daemon_running():
     try:
-        with socket.socket(socket.AF_UNIX) as s:
-            s.settimeout(0.5)
-            s.connect(SOCK)
+        with socket.create_connection(ADDR, timeout=0.5) as s:
             s.sendall(b"ping\n")
             return s.recv(16).startswith(b"ok")
     except OSError:
@@ -171,10 +189,56 @@ def daemon_running():
 
 
 def send(cmd):
-    with socket.socket(socket.AF_UNIX) as s:
-        s.settimeout(0.5)
-        s.connect(SOCK)
+    with socket.create_connection(ADDR, timeout=0.5) as s:
         s.sendall(cmd.encode() + b"\n")
+
+
+def wait_for(running):
+    for _ in range(50):
+        if daemon_running() == running:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def start():
+    if daemon_running():
+        log("Already running.")
+        return 0
+    if not load_config().get("address"):
+        log("No device configured. Run /led-setup first.")
+        return 1
+    os.makedirs(HOME, exist_ok=True)
+    script = os.path.abspath(__file__)
+    if sys.platform == "darwin" and build_app():
+        via_app(["serve"])
+    else:
+        exe, flags = sys.executable, {"start_new_session": True}
+        if WINDOWS:
+            # pythonw: no console window. DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP.
+            exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            exe = exe if os.path.exists(exe) else sys.executable
+            flags = {"creationflags": 0x00000008 | 0x00000200}
+        with open(LOG, "a") as out:
+            subprocess.Popen([exe, script, "serve"], stdin=subprocess.DEVNULL, stdout=out, stderr=out, **flags)
+    if wait_for(True):
+        log("running")
+        return 0
+    log("Not running. See", LOG)
+    return 1
+
+
+def stop():
+    try:
+        send("quit")
+    except OSError:
+        log("stopped")
+        return 0
+    if wait_for(False):
+        log("stopped")
+        return 0
+    log("Still running. See", LOG)
+    return 1
 
 
 def build_app():
@@ -236,31 +300,52 @@ def via_app(args):
 
 
 def autostart(remove=False):
-    if sys.platform != "darwin":
-        log("macOS only. On Linux, run `python3 %s serve` from a systemd user service." % os.path.abspath(__file__))
-        return 1
-    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], capture_output=True)
+    """Run the daemon at login: LaunchAgent (macOS), systemd user service (Linux),
+    Startup folder script (Windows). Each restarts it only after a crash, so `stop` sticks."""
+    script = os.path.join(HOME, "led.py")
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], capture_output=True)
+        entry = AGENT
+    elif WINDOWS:
+        entry = STARTUP
+    else:
+        if remove and os.path.exists(UNIT):
+            subprocess.run(["systemctl", "--user", "disable", "--now", "led-notify"], capture_output=True)
+        entry = UNIT
     if remove:
-        for path in (AGENT, os.path.join(HOME, "led.py")):
+        stop()
+        for path in (entry, script):
             if os.path.exists(path):
                 os.remove(path)
         log("Autostart removed.")
         return 0
+
     if not load_config().get("address"):
         log("No device configured. Run /led-setup first.")
         return 1
-    if not build_app():
+    if sys.platform == "darwin" and not build_app():
         log("Needs a framework build of Python (python.org or Homebrew).")
         return 1
+    stop()
     # Stable copy: the plugin directory changes on every update.
-    script = os.path.join(HOME, "led.py")
+    os.makedirs(HOME, exist_ok=True)
     shutil.copy(os.path.abspath(__file__), script)
-    subprocess.run(["pkill", "-f", "led.py serve"], capture_output=True)
-    os.makedirs(os.path.dirname(AGENT), exist_ok=True)
-    with open(AGENT, "w") as f:
-        f.write(AGENT_PLIST % {"label": LABEL, "exe": APP_EXE, "script": script, "log": LOG})
-    subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), AGENT], check=True)
-    log("Autostart installed: the daemon runs now and at every login.")
+    os.makedirs(os.path.dirname(entry), exist_ok=True)
+    if sys.platform == "darwin":
+        with open(entry, "w") as f:
+            f.write(AGENT_PLIST % {"label": LABEL, "exe": APP_EXE, "script": script, "log": LOG})
+        subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), entry], check=True)
+    elif WINDOWS:
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        with open(entry, "w") as f:
+            f.write('@start "" "%s" "%s" serve\n' % (pythonw if os.path.exists(pythonw) else sys.executable, script))
+        start()
+    else:
+        with open(entry, "w") as f:
+            f.write(UNIT_TEXT % {"exe": sys.executable, "script": script, "log": LOG})
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "led-notify"], check=True)
+    log("Autostart installed (%s): the daemon runs now and at every login." % entry)
     return 0
 
 
@@ -323,16 +408,16 @@ async def serve():
     if daemon_running():
         log("Daemon already running.")
         return 0
-    os.makedirs(HOME, exist_ok=True)
-    if os.path.exists(SOCK):
-        os.unlink(SOCK)
+    if sys.stdout is None:  # pythonw (Windows Startup folder) has no console
+        os.makedirs(HOME, exist_ok=True)
+        sys.stdout = sys.stderr = open(LOG, "a")
 
     protocol = cfg["protocol"]
     char = PROTOCOLS[protocol]["char"]
     client = BleakClient(cfg["address"])
     lock = asyncio.Lock()
     pending_off = None
-    stop = asyncio.Event()
+    stopping = asyncio.Event()
 
     async def write(kind, color=(0, 0, 0)):
         async with lock:
@@ -366,6 +451,8 @@ async def serve():
             if cmd == "ping":
                 writer.write(b"ok\n")
                 await writer.drain()
+            elif cmd == "quit":
+                stopping.set()
             elif cmd:
                 await apply(cmd)
         except Exception as e:
@@ -374,7 +461,7 @@ async def serve():
             writer.close()
 
     async def keep_connected():
-        while not stop.is_set():
+        while not stopping.is_set():
             if not client.is_connected:
                 try:
                     await client.connect(timeout=10)
@@ -382,22 +469,23 @@ async def serve():
                 except Exception as e:
                     log("BLE connect failed, retrying in 5 s:", e)
             try:
-                await asyncio.wait_for(stop.wait(), 5)
+                await asyncio.wait_for(stopping.wait(), 5)
             except asyncio.TimeoutError:
                 pass
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
-    server = await asyncio.start_unix_server(handle, SOCK)
-    log("Listening on", SOCK)
+        try:
+            loop.add_signal_handler(sig, stopping.set)
+        except (NotImplementedError, AttributeError):
+            pass  # Windows: use `led.py stop`
+    server = await asyncio.start_server(handle, *ADDR)
+    log("Listening on %s:%d" % ADDR)
     ble = asyncio.ensure_future(keep_connected())
     try:
-        await stop.wait()
+        await stopping.wait()
     finally:
         server.close()
-        if os.path.exists(SOCK):
-            os.unlink(SOCK)
         await ble
         if client.is_connected:
             try:
@@ -473,6 +561,10 @@ def main(argv):
             return 1
     if cmd == "autostart":
         return autostart(args == ["remove"])
+    if cmd == "start":
+        return start()
+    if cmd == "stop":
+        return stop()
     if cmd in ("scan", "probe", "serve", "test") and sys.platform == "darwin" and not in_app() and build_app():
         return via_app(argv[1:])
     if cmd == "scan":

@@ -106,8 +106,10 @@ export const Led = async ({ $ }) => ({
 
 ## Anything else
 
-If your tool can run a command, call `led.py send <preset>`. Any Unix-socket client works too:
+If your tool can run a command, call `led.py send <preset>`. On Windows, use `python` where these snippets say `python3` if needed.
+
+Anything that can open a TCP connection works too. Send one line to `127.0.0.1:47821`:
 
 ```
-echo "flash 0 255 0 2" | nc -U ~/.config/claude-led/led.sock
+echo "flash 0 255 0 2" | nc -w 1 127.0.0.1 47821
 ```

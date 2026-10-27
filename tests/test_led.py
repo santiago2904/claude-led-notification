@@ -3,9 +3,11 @@
 Uses a fake `bleak` module, so no hardware or bleak install is needed.
 """
 import asyncio
+import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -36,10 +38,12 @@ class FakeClient:
 
 class LedTest(unittest.TestCase):
     def setUp(self):
-        # Short path: Unix socket paths are limited to ~104 chars on macOS.
         self.home = tempfile.mkdtemp(prefix="led")
         self.addCleanup(shutil.rmtree, self.home, True)
         os.environ["CLAUDE_LED_HOME"] = self.home
+        with socket.socket() as s:  # a free port, so tests never hit a real daemon
+            s.bind(("127.0.0.1", 0))
+            os.environ["CLAUDE_LED_PORT"] = str(s.getsockname()[1])
         sys.modules["bleak"] = types.SimpleNamespace(BleakClient=FakeClient)
         sys.path.insert(0, os.path.dirname(SCRIPT))
         sys.modules.pop("led", None)
@@ -51,10 +55,36 @@ class LedTest(unittest.TestCase):
             json.dump({"address": "AA:BB", "protocol": "ELK-BLEDOM"}, f)
 
     def test_send_without_daemon_is_silent(self):
-        env = dict(os.environ, CLAUDE_LED_HOME=self.home)
+        env = dict(os.environ)
         for args in (["send", "thinking"], ["send"], ["send", "garbage", "x"]):
             p = subprocess.run([sys.executable, SCRIPT] + args, env=env, capture_output=True, timeout=5)
             self.assertEqual((p.returncode, p.stdout, p.stderr), (0, b"", b""))
+
+    def test_hook_commands_are_silent_without_daemon(self):
+        # Runs hooks.json exactly as Claude Code does (bash), including the
+        # python3 -> python fallback that Windows relies on.
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash not available")
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "hooks", "hooks.json")) as f:
+            hooks = json.load(f)["hooks"]
+        for event, groups in hooks.items():
+            cmd = groups[0]["hooks"][0]["command"].replace("${CLAUDE_PLUGIN_ROOT}", os.path.abspath(root).replace("\\", "/"))
+            p = subprocess.run([bash, "-c", cmd], capture_output=True, timeout=10)
+            self.assertEqual((event, p.returncode, p.stdout, p.stderr), (event, 0, b"", b""))
+
+    @unittest.skipUnless(importlib.util.find_spec("bleak") or os.environ.get("CI"), "needs the real bleak")
+    def test_start_stop(self):
+        # Spawns the real detached daemon. There is no strip, so it just keeps retrying BLE.
+        if sys.platform == "darwin":
+            self.skipTest("macOS goes through LED Notify.app; verified by hand")
+        run = lambda *a: subprocess.run([sys.executable, SCRIPT] + list(a), capture_output=True, text=True, timeout=30)
+        self.assertEqual(run("start").stdout.strip(), "running")
+        self.assertEqual(run("status").stdout.strip(), "running")
+        self.assertEqual(run("start").stdout.strip(), "Already running.")
+        self.assertEqual(run("stop").stdout.strip(), "stopped")
+        self.assertEqual(run("status").stdout.strip(), "stopped")
 
     def test_parse(self):
         presets = self.led.DEFAULT_PRESETS
@@ -79,10 +109,10 @@ class LedTest(unittest.TestCase):
 
         async def run():
             daemon = asyncio.ensure_future(led.serve())
-            while not os.path.exists(led.SOCK):
+            loop = asyncio.get_running_loop()
+            while not await loop.run_in_executor(None, led.daemon_running):
                 await asyncio.sleep(0.01)
             client = FakeClient.instances[0]
-            loop = asyncio.get_running_loop()
 
             async def send(cmd):
                 await loop.run_in_executor(None, led.send, cmd)
@@ -118,9 +148,12 @@ class LedTest(unittest.TestCase):
             await send("off")
             self.assertEqual(client.writes[-1], off)
 
-            os.kill(os.getpid(), __import__("signal").SIGTERM)
+            # `stop` sends "quit": the daemon turns the strip off and exits cleanly
+            client.writes.clear()
+            await send("quit")
             self.assertEqual(await asyncio.wait_for(daemon, 7), 0)
-            self.assertFalse(os.path.exists(led.SOCK))
+            self.assertEqual(client.writes, [off])
+            self.assertFalse(await loop.run_in_executor(None, led.daemon_running))
 
         asyncio.run(run())
 
